@@ -5,11 +5,17 @@
 
 export const DEFAULT_ALLOWED_APPS = [
   "Calendar",
+  "日历",
   "Calculator",
+  "计算器",
   "TextEdit",
+  "文本编辑",
   "NetEaseMusic",
+  "网易云音乐",
   "Figma",
   "Google Chrome",
+  "Safari",
+  "Safari浏览器",
   "Codex In-app Browser",
 ];
 
@@ -33,7 +39,15 @@ export const DEFAULT_THRESHOLDS = {
 };
 
 /** 零副作用、可随时重来的 App：置信度门槛可放宽（安全仍由 risk/敏感词把关） */
-export const LOW_RISK_APPS = ["Calculator", "Calendar", "TextEdit", "Figma"];
+export const LOW_RISK_APPS = [
+  "Calculator",
+  "计算器",
+  "Calendar",
+  "日历",
+  "TextEdit",
+  "文本编辑",
+  "Figma",
+];
 
 export function matchSensitive(label = "") {
   const text = String(label);

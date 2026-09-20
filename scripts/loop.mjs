@@ -8,7 +8,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { decide as jevDecide } from "./jev-decide.mjs";
+import { decide as antigravityDecide, detectEngineAvailability } from "./antigravity-decide.mjs";
 import { evaluatePolicy, DEFAULT_ALLOWED_APPS } from "./policy.mjs";
+import { createMacDriver } from "./driver/mac-driver.mjs";
+
+export { createMacDriver, antigravityDecide, detectEngineAvailability };
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -98,7 +102,7 @@ export function selectCandidates(elements, goal = "", { max = 40 } = {}) {
   const tokens = String(goal)
     .toLowerCase()
     .split(/[^a-z0-9\u4e00-\u9fff]+/)
-    .filter((t) => t.length >= 2);
+    .filter((t) => t.length >= 2 || /^\d+$/.test(t));
 
   const scored = [];
   for (const el of elements) {
@@ -182,12 +186,13 @@ export async function runTask({
   driver,
   appName,
   goal,
+  engine = "auto", // "auto" | "jev" | "antigravity"
   dryRun = true,
   maxSteps = 30,
   candidateMax = 40, // 候选上限：大日历树（42 个日格 + 弹层字段）需要调大
   allowedApps = DEFAULT_ALLOWED_APPS,
   thresholds,
-  decide = jevDecide,
+  decide,
   emit = defaultEmit,
   traceDir = path.join(PROJECT_DIR, "runs"),
   traceId,
@@ -197,16 +202,43 @@ export async function runTask({
   jevOptions = {},
   verify, // 可选：完整 AX → boolean；提供后以此核验总目标
 }) {
+  let activeEngine = engine;
+  let decideFn = decide;
+  if (!decideFn) {
+    if (activeEngine === "jev") {
+      decideFn = jevDecide;
+    } else if (activeEngine === "antigravity") {
+      decideFn = antigravityDecide;
+    } else {
+      const avail = detectEngineAvailability();
+      activeEngine = avail.defaultEngine;
+      decideFn = activeEngine === "jev" ? jevDecide : antigravityDecide;
+    }
+  }
+
   const runId = traceId ?? `${new Date().toISOString().replace(/[:.]/g, "-")}-${appName.replace(/\W+/g, "")}`;
   fs.mkdirSync(traceDir, { recursive: true });
   const tracePath = path.join(traceDir, `${runId}.jsonl`);
   const record = (entry) => fs.appendFileSync(tracePath, JSON.stringify({ ts: new Date().toISOString(), runId, ...entry }) + "\n");
 
-  emit(`[jev-use] run=${runId} app=${appName} dryRun=${dryRun} goal=${goal}`);
-  record({ event: "start", appName, goal, dryRun, maxSteps, plan });
+  emit(`[jev-use] run=${runId} app=${appName} engine=${activeEngine} dryRun=${dryRun} goal=${goal}`);
+  record({ event: "start", appName, goal, engine: activeEngine, dryRun, maxSteps, plan });
 
-  await driver.bind(appName);
-  let observation = await driver.observe({ full: true });
+  const activeDriver = driver ?? createMacDriver();
+  const ownDriver = !driver;
+
+  let observation;
+  try {
+    await activeDriver.bind(appName);
+    observation = await activeDriver.observe({ full: true });
+  } catch (err) {
+    record({ event: "bind_error", message: err.message });
+    if (ownDriver && activeDriver.close) {
+      try { await activeDriver.close(); } catch {}
+    }
+    return { status: "error", message: `绑定/观测 App 失败：${err.message}`, tracePath };
+  }
+
   const recentActions = [];
   const startedAt = Date.now();
 
@@ -230,7 +262,7 @@ export async function runTask({
     let candidates = selectCandidates(parseAX(observation), stepGoal, { max: candidateMax });
     // 观测不足以支撑决策时（例如上一动作返回的 diff 里没有可解析元素），换成完整树重试一次
     if (candidates.length < 2) {
-      observation = await driver.observe({ full: true });
+      observation = await activeDriver.observe({ full: true });
       candidates = selectCandidates(parseAX(observation), stepGoal, { max: candidateMax });
       if (candidates.length < 2) {
         record({ event: "no_candidates", step });
@@ -248,7 +280,7 @@ export async function runTask({
 
     let decision;
     try {
-      decision = await decide({
+      decision = await decideFn({
         goal: stepGoal,
         app: appName,
         candidates,
@@ -259,6 +291,9 @@ export async function runTask({
       });
     } catch (err) {
       record({ event: "decide_error", step, message: err.message });
+      if (ownDriver && activeDriver.close) {
+        try { await activeDriver.close(); } catch {}
+      }
       return { status: "error", step, message: err.message, tracePath };
     }
 
@@ -298,7 +333,7 @@ export async function runTask({
     // 参数既可以是一份静态配置，也可以是按步生成的回调（Planner 决定"做什么"，Jev 决定"点哪里"）
     const stepResources = typeof resources === "function" ? ((await resources(step, decision)) ?? {}) : resources;
     try {
-      await executeAction(driver, decision, stepResources);
+      await executeAction(activeDriver, decision, stepResources);
     } catch (err) {
       record({ event: "action_error", step, message: err.message });
       return finish("error", { steps: step, tracePath, message: `动作执行失败：${err.message}`, elapsedMs: Date.now() - startedAt });
@@ -306,7 +341,7 @@ export async function runTask({
     const actMs = Date.now() - tAct;
 
     const previousObservation = observation;
-    observation = await driver.observe({ full: true });
+    observation = await activeDriver.observe({ full: true });
     const noChange = observation === previousObservation;
     recentActions.push(`${decision.action} i${decision.targetIndex} → ${noChange ? "no change" : "changed"}`);
     emit(`         └ 动作 ${actMs}ms · ${noChange ? "界面无变化" : "界面已变化"}`);
@@ -318,7 +353,10 @@ export async function runTask({
   }
   return finish("max_steps", { steps: maxSteps, tracePath, elapsedMs: Date.now() - startedAt });
 
-  function finish(status, extra) {
+  async function finish(status, extra) {
+    if (ownDriver && activeDriver.close) {
+      try { await activeDriver.close(); } catch {}
+    }
     record({ event: "finish", status, ...extra });
     emit(`[jev-use] 结束：${status} · 用时 ${(extra.elapsedMs / 1000).toFixed(1)}s · trace=${tracePath}`);
     return { status, ...extra };
